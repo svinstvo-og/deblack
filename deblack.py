@@ -1,57 +1,114 @@
 import os
-import argparse
+import io
+import logging
 from PIL import Image
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
-SUPPORTED_FORMATS = (".png", ".jpg", ".jpeg", ".bmp")
+# coniggggg
+# not a real loken btw
+TOKEN = "8410894634:AAFKYM7xazlu8nwG44w0MLgC4SdKtjVJIr"
 
+#ids
+ALLOWED_USER_IDS = {603056985} 
 
-def process_image(path: str, tolerance: int, replacement: int):
-    """Convert black pixels to near-black and save as new file."""
-    img = Image.open(path).convert("RGB")
+DEFAULT_TOLERANCE = 25
+DEFAULT_REPLACEMENT = 50
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+def process_image_in_memory(image_bytes: bytes, tolerance: int, replacement: int) -> io.BytesIO:
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     pixels = img.load()
-
     width, height = img.size
-    modified = False
+    
+    replacement_color = (replacement, replacement, replacement)
 
     for x in range(width):
         for y in range(height):
             r, g, b = pixels[x, y]
             if r <= tolerance and g <= tolerance and b <= tolerance:
-                pixels[x, y] = (replacement, replacement, replacement)
-                modified = True
+                pixels[x, y] = replacement_color
 
-    if modified:
-        base, ext = os.path.splitext(path)
-        new_path = f"{base}_processed{ext}"
-        img.save(new_path)
-        print(f"✔ Processed: {os.path.basename(path)} → {os.path.basename(new_path)}")
+    output_buffer = io.BytesIO()
+    img.save(output_buffer, format="JPEG", quality=95)
+    output_buffer.seek(0)
+    return output_buffer
+
+def parse_caption_params(caption: str):
+    tol = DEFAULT_TOLERANCE
+    rep = DEFAULT_REPLACEMENT
+    
+    if not caption:
+        return tol, rep
+
+    tokens = caption.split()
+    for i, token in enumerate(tokens):
+        if token == "/tolerance" and i + 1 < len(tokens):
+            try:
+                tol = int(tokens[i+1])
+            except ValueError:
+                pass
+        elif token == "/replacement" and i + 1 < len(tokens):
+            try:
+                rep = int(tokens[i+1])
+            except ValueError:
+                pass
+                
+    return tol, rep
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if user_id not in ALLOWED_USER_IDS:
+        logging.warning(f"Unauthorized access attempt from ID: {user_id}")
+        return 
+
+    if update.message.document:
+        file_id = update.message.document.file_id
+        file_name = update.message.document.file_name
+    elif update.message.photo:
+        file_id = update.message.photo[-1].file_id
+        file_name = "image.jpg"
     else:
-        print(f"⚪ Skipped (no black pixels found): {os.path.basename(path)}")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Convert black pixels to near-black for printing without black ink.")
-    parser.add_argument("--tolerance", type=int, default=25,
-                        help="RGB threshold for what counts as black (default: 25)")
-    parser.add_argument("--replacement", type=int, default=50,
-                        help="Replacement RGB value for near-black (default: 50)")
-    args = parser.parse_args()
-
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    images = [f for f in os.listdir(current_dir)
-              if os.path.splitext(f)[1].lower() in SUPPORTED_FORMATS]
-
-    if not images:
-        print("⚠️ No supported image files found in this directory.")
         return
 
-    print(f"🖨 Found {len(images)} image(s). Starting conversion...\n")
+    caption = update.message.caption or ""
+    tolerance, replacement = parse_caption_params(caption)
 
-    for filename in images:
-        process_image(os.path.join(current_dir, filename), args.tolerance, args.replacement)
+    status_msg = await update.message.reply_text(
+        f"⏳ Downloading & Processing...\n"
+        f"⚙️ Tolerance: {tolerance} | Replacement: {replacement}"
+    )
 
-    print("\n✅ Done! Processed images saved with '_processed' suffix.")
+    try:
+        new_file = await context.bot.get_file(file_id)
+        file_byte_array = await new_file.download_as_bytearray()
 
+        processed_io = process_image_in_memory(bytes(file_byte_array), tolerance, replacement)
 
-if __name__ == "__main__":
-    main()
+        await update.message.reply_document(
+            document=processed_io,
+            filename=f"fixed_{file_name}",
+            caption="✅ Here is your printer-friendly image."
+        )
+        
+        await status_msg.delete()
+
+    except Exception as e:
+        logging.error(f"Error processing image: {e}")
+        await status_msg.edit_text(f"❌ Error: {str(e)}")
+
+if __name__ == '__main__':
+    application = ApplicationBuilder().token(TOKEN).build()
+
+    image_filter = filters.PHOTO | filters.Document.IMAGE
+    
+    handler = MessageHandler(image_filter, handle_photo)
+    application.add_handler(handler)
+
+    print("🤖 Bot is running...")
+    application.run_polling()
